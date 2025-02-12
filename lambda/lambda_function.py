@@ -1,24 +1,19 @@
 import json
 import os
-import uuid
-
 import boto3
-import hashlib
-import base64
 import time
+import hashlib
 from urllib.parse import urlparse
 
 dynamodb = boto3.resource("dynamodb")
-table_name = os.environ.get("TABLE_NAME")
-if not table_name:
-    raise RuntimeError("TABLE_NAME environment variable is missing!")
+sns_client = boto3.client("sns")
 
+table_name = os.environ["TABLE_NAME"]
+sns_topic_arn = os.environ["SNS_TOPIC_ARN"]
 table = dynamodb.Table(table_name)
-
 
 def handler(event, context):
     """Handles both URL shortening (POST) and redirection (GET)"""
-
     http_method = event.get("httpMethod")
 
     if http_method == "POST":
@@ -30,7 +25,7 @@ def handler(event, context):
 
 
 def shorten_url(event):
-    """Shortens the URL and ensures unique short_id in DynamoDB"""
+    """Shortens the URL and sends a notification"""
     try:
         body = json.loads(event["body"])
         original_url = body.get("url")
@@ -38,27 +33,25 @@ def shorten_url(event):
         if not original_url or not is_valid_url(original_url):
             return {"statusCode": 400, "body": json.dumps({"error": "Invalid URL"})}
 
-        short_id = None
-        for _ in range(5):
-            candidate_id = generate_short_id(original_url)
-            existing_entry = table.get_item(Key={"short_id": candidate_id})
+        short_id = generate_short_id(original_url)
 
-            if "Item" not in existing_entry:
-                short_id = candidate_id
-                break  # Found a unique ID
-
-        if not short_id:
-            return {"statusCode": 500, "body": json.dumps({"error": "Failed to generate a unique short URL"})}
-
-        # Set TTL (5 minutes expiration)
         ttl_value = int(time.time()) + 300
 
-        # Store in DynamoDB
         table.put_item(Item={"short_id": short_id, "original_url": original_url, "ttl": ttl_value})
 
-        # Get API Gateway URL dynamically
         base_url = f"https://{event['headers']['Host']}/{event['requestContext']['stage']}"
         short_url = f"{base_url}/{short_id}"
+
+        sns_client.publish(
+            TopicArn=sns_topic_arn,
+            Subject="New Shortened URL Created",
+            Message=(
+                f"A new short URL was created!\n\n"
+                f"Short Link: {short_url}\n"
+                f"Original URL: {original_url}\n"
+                f"Expires in: 5 minutes"
+            )
+        )
 
         return {"statusCode": 200, "body": json.dumps({"short_url": short_url})}
 
@@ -67,6 +60,7 @@ def shorten_url(event):
 
 
 def resolve_url(event):
+    """Resolves short URL, deletes it after access, and sends a notification"""
     path_params = event.get("pathParameters") or {}
     short_id = path_params.get("short_id")
 
@@ -78,17 +72,30 @@ def resolve_url(event):
     if "Item" not in response:
         return {"statusCode": 404, "body": json.dumps({"error": "URL not found"})}
 
+    original_url = response["Item"]["original_url"]
+
+    table.delete_item(Key={"short_id": short_id})
+
+    sns_client.publish(
+        TopicArn=sns_topic_arn,
+        Subject="Shortened URL Accessed",
+        Message=(
+            f"A user accessed a shortened URL!\n\n"
+            f"Short Link ID: {short_id}\n"
+            f"Redirected to: {original_url}"
+        )
+    )
+
     return {
         "statusCode": 302,
-        "headers": {"Location": response["Item"]["original_url"]}
+        "headers": {"Location": original_url}
     }
 
 
 def generate_short_id(url):
-    """Generate a unique short ID with randomness"""
-    unique_string = url + str(time.time()) + str(uuid.uuid4())
-    hash_digest = hashlib.md5(unique_string.encode()).digest()
-    return base64.urlsafe_b64encode(hash_digest)[:6].decode("utf-8")
+    """Generate a unique short ID"""
+    hash_digest = hashlib.md5((url + str(time.time())).encode()).hexdigest()
+    return hash_digest[:6]
 
 
 def is_valid_url(url):
