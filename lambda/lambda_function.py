@@ -1,5 +1,7 @@
 import json
 import os
+import uuid
+
 import boto3
 import hashlib
 import base64
@@ -83,8 +85,9 @@ def resolve_url(event):
 
 
 def generate_short_id(url):
-    """Generate a short ID"""
-    hash_digest = hashlib.md5(url.encode()).digest()
+    """Generate a unique short ID with randomness"""
+    unique_string = url + str(time.time()) + str(uuid.uuid4())
+    hash_digest = hashlib.md5(unique_string.encode()).digest()
     return base64.urlsafe_b64encode(hash_digest)[:6].decode("utf-8")
 
 
